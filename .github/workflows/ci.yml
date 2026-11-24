@@ -33,6 +33,7 @@ jobs:
           mkdir upload
           mv build/Pongo.bin upload/
           mv build/checkra1n-kpf-pongo upload/
+          mv build/sep-artk-derive.bin upload/
 
       - name: Compile KPF and Pongo Development
         run: |
@@ -44,10 +45,6 @@ jobs:
           mv build/Pongo.bin upload/Pongo.bin.development
           mv build/checkra1n-kpf-pongo upload/checkra1n-kpf-pongo.development
 
-      - name: Get branch name
-        id: branch-name
-        uses: tj-actions/branch-names@v7
-
       - name: Upload artifact
         uses: wangyucode/sftp-upload-action@v3
         with:
@@ -58,5 +55,5 @@ jobs:
           forceUpload: true
           dryRun: false
           localDir: 'upload'
-          remoteDir: "/palera1n/artifacts/kpf/${{ steps.branch-name.outputs.ref_branch || github.ref }}"
+          remoteDir: "/palera1n/artifacts/kpf/${{ github.ref_type == 'tag' && github.ref || github.ref_name }}"
 
