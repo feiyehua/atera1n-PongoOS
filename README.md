@@ -1,3 +1,7 @@
+# License for this Repo
+Please note that all source code related to my A8 SEP Exploit are licensed under GPLv2. 
+Feel free to use or modify them, or integrate into your tool, but don't forget to open-source your code for others to research!
+
 # pongoOS
 
 A pre-boot execution environment for Apple boards built on top of checkra1n.
