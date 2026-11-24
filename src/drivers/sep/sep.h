@@ -27,3 +27,13 @@
 void sep_setup(void);
 void sep_teardown(void);
 extern void (*sepfw_kpf_hook)(void* sepfw_bytes, size_t sepfw_size);
+
+/* Pwned-SEPROM opcodes used by the shellcode load/replay commands. */
+#define SEP_PWNED_POKE_ADDR_OPCODE 0xC1
+#define SEP_PWNED_POKE_DATA_OPCODE 0xC2
+
+/* Shellcode observation and reload commands (implemented in a8_sep_exploit.c). */
+void sep_observe(const char *cmd, char *args);
+void sep_shc(const char *cmd, char *args);
+void sep_replay(const char *cmd, char *args);
+void sep_load(const char *cmd, char *args);

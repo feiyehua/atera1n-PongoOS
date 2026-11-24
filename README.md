@@ -29,6 +29,13 @@ If `clang`, `ld64` or `cctools-strip` don't have their default names/paths, you'
 
     EMBEDDED_CC=clang EMBEDDED_LDFLAGS=-fuse-ld=/usr/bin/ld64 STRIP=cctools-strip make all
 
+## Using clangd
+
+Run `make clangd` with Python 3 installed to generate `compile_commands.json`
+for the firmware's C sources and `tools/vmacho.c`. The firmware uses the Newlib
+headers installed by the build. Run `make clangd` again after changing compiler
+options or adding source files.
+
 ## Build artifacts
 
 The Makefile will create four binaries in `build/`:

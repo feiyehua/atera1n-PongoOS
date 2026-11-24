@@ -1,0 +1,6 @@
+BasedOnStyle: LLVM
+AllowShortFunctionsOnASingleLine: None
+AllowShortLambdasOnASingleLine: None
+BreakBeforeBraces: Allman
+IndentWidth: 4
+UseTab: Never

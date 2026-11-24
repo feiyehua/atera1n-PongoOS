@@ -24,10 +24,12 @@
  * SOFTWARE.
  *
  */
+#include "stdio.h"
 #include <pongo.h>
 #include <img4/img4.h>
 #include <fuse/fuse.h>
 #include <recfg/recfg_soc.h>
+#include <sep/nvram_art.h>
 
 #define IRQ_T8015_SEP_INBOX_NOT_EMPTY 0x79
 // #define SEP_DEBUG
@@ -85,9 +87,11 @@ static uint64_t gSEPFWLen;
 static volatile struct mailbox_registers32 * mailboxregs32;
 static volatile struct mailbox_registers64 * mailboxregs64;
 static int is_sep64 = 0;
-struct event sep_msg_event, sep_rand_event, sep_boot_event, sep_load_event, sep_panic_event, sep_done_tz0_event, sep_done_integrity_tree_event;
+struct event sep_msg_event, sep_rand_event, sep_boot_event, sep_load_event, sep_panic_event, sep_done_tz0_event, sep_done_integrity_tree_event, sep_pwned_peek_event;
 volatile uint32_t rnd_val;
-volatile uint32_t sep_has_loaded, sep_has_booted, sep_has_panicked, sep_has_done_tz0, seprom_has_left_to_sepos;
+volatile uint32_t sep_has_loaded, sep_has_booted, sep_has_panicked, sep_has_done_tz0, seprom_has_left_to_sepos, seprom_has_accepted_art;
+uint32_t sep_pwned_peek_val = 0xdeadbeef;
+
 void (*sepfw_kpf_hook)(void* sepfw_bytes, size_t sepfw_size);
 void sepfw_kpf(void* sepfw_bytes, size_t sepfw_size) {
     uint32_t* insn_stream = sepfw_bytes;
@@ -117,9 +121,11 @@ static inline void mailbox_write(uint64_t value) {
 #endif
 
     if (is_sep64) {
+        while ((mailboxregs64->snd_sts >> 16) & 1) {}
         mailboxregs64->snd0 = value;
         mailboxregs64->snd1 = 0;
     } else {
+        while ((mailboxregs32->snd_sts >> 16) & 1) {}
         mailboxregs32->snd0 = value & 0xffffffff;
         mailboxregs32->snd1 = (value >> 32ULL) & 0xffffffff;
     }
@@ -165,6 +171,8 @@ static inline uint64_t mailbox_read_fast(void) {
     return rd;
 }
 extern void sep_racer(void* observe_b0, void* observe_bs, void* null_b0, void* null_bs, void* replay, uint64_t size, void* shct, void* shv);
+// Must aligned to 64 bytes
+extern void fast_copy(void *dst, const void *src, size_t size);
 void  do_sep_racer(void* observe_b0, void* observe_bs, void* null_b0, void* null_bs, void* replay, uint64_t size, void* shct, void* shv, uint64_t msg) {
     disable_interrupts();
     mailbox_write_fast(msg);
@@ -185,7 +193,9 @@ void seprom_execute_opcode(uint8_t operation, uint8_t param, uint32_t data) {
     sep_send_msg(255, 0x0, operation, param, data);
 }
 
-void sep_handle_msg_from_seprom(union sep_message_u msg) {
+bool sep_is_pwned;
+void sep_handle_msg_from_seprom(union sep_message_u msg)
+{
     if (msg.msg.opcode == 255) {
         fiprintf(stderr, "SEPROM panic!\n");
         sep_has_panicked = true;
@@ -199,11 +209,28 @@ void sep_handle_msg_from_seprom(union sep_message_u msg) {
         event_fire(&sep_load_event);
     } else if (msg.msg.opcode == (6 + 100)) {
         seprom_has_left_to_sepos = true;
+    } else if (msg.msg.opcode == (7 + 100) /* 0x6B */) {
+        seprom_has_accepted_art = true;
     } else if (msg.msg.opcode == 0xd2) {
         sep_has_done_tz0 = true;
         event_fire(&sep_done_tz0_event);
     } else if (msg.msg.opcode == (17 + 100)) {
         event_fire(&sep_done_integrity_tree_event);
+    }
+    else if (msg.msg.opcode == 0xab)
+    {
+        iprintf("sep pwned with opcode %x\n", msg.msg.opcode);
+        iprintf("with data %x\n", msg.msg.data);
+        sep_is_pwned = 1;
+    }
+    else if (msg.msg.opcode == 0xac)
+    {
+        sep_pwned_peek_val = msg.msg.data;
+        event_fire(&sep_pwned_peek_event);
+    }
+    else
+    {
+        iprintf("got seprom message %x\n", msg.msg.opcode);
     }
 }
 
@@ -275,19 +302,53 @@ void seprom_ping(void) {
 }
 static int parse_sepfw(Img4 *img4, uint32_t *imglen)
 {
+    if(imglen) *imglen = 0;
+    iprintf("[sepfw] buffer=%p size=0x%llx\n", gSEPFW, (unsigned long long)gSEPFWLen);
+    if(!img4 || !gSEPFW)
+    {
+        iprintf("[sepfw] Invalid output or missing firmware buffer; check sep_setup and /chosen/memory-map/SEPFW\n");
+        return DR_ParamErr;
+    }
+    if(gSEPFWLen > UINT32_MAX)
+    {
+        iprintf("[sepfw] Firmware length exceeds the 32-bit DER size limit\n");
+        return DR_BufOverflow;
+    }
+
     uint32_t len = (uint32_t)gSEPFWLen;
     DERByte* data = gSEPFW;
+    if(len)
+    {
+        iprintf("[sepfw] First firmware bytes (up to 64):\n");
+        hexdump(data, len < 64 ? len : 64);
+    }
+    if(len < 2)
+    {
+        iprintf("[sepfw] Firmware is too short for a DER header\n");
+        return DR_DecodeError;
+    }
+
     uint32_t type = 0;
     DERItem tmp = { .data = data, .length = len };
     DERDecodedInfo decoded;
     int rv = DERDecodeItem(&tmp, &decoded);
+    iprintf("[sepfw] DERDecodeItem: rv=%d (0x%x)\n", rv, (unsigned)rv);
     if (0 != rv) return rv;
     len = decoded.content.length + (decoded.content.data - data);
+    iprintf("[sepfw] DER tag=0x%llx content=0x%x total=0x%x\n",
+            (unsigned long long)decoded.tag, decoded.content.length, len);
     rv = Img4DecodeInit(data, len, img4);
+    iprintf("[sepfw] Img4DecodeInit: rv=%d (0x%x)\n", rv, (unsigned)rv);
     if (0 != rv) return rv;
     rv = Img4DecodeGetPayloadType(img4, &type);
+    iprintf("[sepfw] Img4DecodeGetPayloadType: rv=%d (0x%x) type=0x%08x\n",
+            rv, (unsigned)rv, type);
     if (0 != rv) return rv;
-    if (type != 0x73657069) return 0x73657069; // sepi
+    if (type != 0x73657069)
+    {
+        iprintf("[sepfw] Unexpected payload type; expected sepi (0x73657069)\n");
+        return 0x73657069; // sepi
+    }
 
     if(imglen) *imglen = len;
     return 0;
@@ -382,6 +443,15 @@ void seprom_fwload(void) {
     is_waiting_to_boot = 0;
     seprom_load_sepos(gSEPFW, 0);
 }
+void seprom_fwload_async(void * firmware) {
+    // We clear this here to account for "sep auto" followed by manual invocation
+    is_waiting_to_boot = 0;
+    if(socnum == 0x8015) {
+        recfg_soc_lock();
+    }
+    disable_interrupts();
+    seprom_execute_opcode(6, 0, vatophys((uint64_t) (firmware == NULL ? gSEPFW : firmware)) >> 12);
+}
 asm(".text\n"
     ".align 2\n"
     ".globl _copy_block\n"
@@ -398,7 +468,6 @@ asm(".text\n"
 uint32_t volatile* remote_addr;
 uint32_t volatile* remote_data;
 uint32_t volatile* remote_sts;
-bool sep_is_pwned;
 uint32_t sep_blackbird_read(uint32_t addr) {
     *remote_addr = addr;
     *remote_sts = 1;
@@ -896,10 +965,25 @@ void seprom_load_art(void* art, char mode) {
 }
 void seprom_artload(void) {
     if (!loader_xfer_recv_count) {
-        iprintf("please upload an ART before issuing this command\n");
+        iprintf("Using art read from device tree\n");
+        nvram_art_t art;
+        int rc = nvram_art_load(&art);
+        if (rc != NVRAM_ART_OK) {
+            printf("nvram_art_load failed: %d\n", rc);
+            return;
+        }
+        printf("NVRAM encoded: PA=0x%llx, len=0x%zx\n",
+               (unsigned long long)art.encoded_pa, art.encoded_len);
+        printf("Decoded ART: VA=%p, PA=0x%llx, len=0x%zx\n", (void *)art.art_va,
+               (unsigned long long)art.art_pa, art.art_len);
+        seprom_load_art((void*)art.art_pa, 0);
+        nvram_art_release(&art);
+        return;
+    } else {
+        iprintf("Using art read from USB\n");
+        seprom_load_art((void*)loader_xfer_recv_data, 0);
         return;
     }
-    seprom_load_art((void*)loader_xfer_recv_data, 0);
 }
 void seprom_resume(void) {
     disable_interrupts();
@@ -927,6 +1011,8 @@ struct sep_command {
 
 void sep_help(const char* cmd, char* args);
 #define SEP_COMMAND(_name, _desc, _cb) {.name = _name, .desc = _desc, .cb = _cb}
+#define SEP_PWNED_PEEK_OPCODE 0xC0
+#define SEP_PWNED_BRANCH_OPCODE 0xC3
 void sep_pwned_peek(const char* cmd, char* args) {
     if(!sep_is_pwned) {
         iprintf("sep is not pwned!\n");
@@ -939,8 +1025,10 @@ void sep_pwned_peek(const char* cmd, char* args) {
     }
 
     uint32_t addr = strtoul(args, NULL, 16);
-    uint32_t rv = sep_blackbird_read((uint32_t)addr);
-    iprintf("0x%x: %x (%x %x %x %x)\n", (uint32_t)addr, rv, rv&0xff, (rv>>8)&0xff, (rv>>16)&0xff, (rv>>24)&0xff);
+    disable_interrupts();
+    seprom_execute_opcode(SEP_PWNED_PEEK_OPCODE, 0, addr);
+    event_wait_asserted(&sep_pwned_peek_event);
+    iprintf("0x%x: %x (%x %x %x %x)\n", (uint32_t)addr, sep_pwned_peek_val, sep_pwned_peek_val&0xff, (sep_pwned_peek_val>>8)&0xff, (sep_pwned_peek_val>>16)&0xff, (sep_pwned_peek_val>>24)&0xff);
 }
 void sep_pwned_poke(const char* cmd, char* args) {
     if(!sep_is_pwned) {
@@ -960,7 +1048,10 @@ void sep_pwned_poke(const char* cmd, char* args) {
     uint32_t addr = strtoul(args, NULL, 16);
     uint32_t value = strtoul(arg1, NULL, 16);
     iprintf("writing %x @ 0x%x\n", value, addr);
-    sep_blackbird_write((uint32_t)addr, (uint32_t)value);
+    disable_interrupts();
+    seprom_execute_opcode(SEP_PWNED_POKE_ADDR_OPCODE, 0, addr);
+    seprom_execute_opcode(SEP_PWNED_POKE_DATA_OPCODE, 0, value);
+    enable_interrupts();
 }
 void sep_pwned_jump(const char* cmd, char* args) {
     if(!sep_is_pwned) {
@@ -979,7 +1070,9 @@ void sep_pwned_jump(const char* cmd, char* args) {
     uint32_t addr = strtoul(args, NULL, 16);
     uint32_t r0 = strtoul(arg1, NULL, 16);
 
-    sep_blackbird_jump_noreturn((uint32_t)addr, r0);
+    disable_interrupts();
+    seprom_execute_opcode(SEP_PWNED_BRANCH_OPCODE, 0, addr);
+    enable_interrupts();
 }
 void sep_pwned_boot(const char* cmd, char* args) {
     if (!is_waiting_to_boot) {
@@ -1152,6 +1245,10 @@ static struct sep_command command_table[] = {
     SEP_COMMAND("poke", "write a 32 bit value", sep_pwned_poke),
     SEP_COMMAND("jump", "jump to address", sep_pwned_jump),
     SEP_COMMAND("boot", "boot pwned tz0 image", sep_pwned_boot),
+    SEP_COMMAND("observe", "observe how sep works", sep_observe),
+    SEP_COMMAND("shc", "get sep payload shellcode", sep_shc),
+    SEP_COMMAND("replay", "replay a previous shellcode", sep_replay),
+    SEP_COMMAND("load", "load a shellcode from usb", sep_load),
 #endif
     SEP_COMMAND("encrypt", "encrypt a kbag (requires pwned SEPROM)", sep_aes_encrypt),
     SEP_COMMAND("decrypt", "decrypt a kbag (requires pwned SEPROM)", sep_aes_decrypt),
@@ -1209,6 +1306,11 @@ void sep_setup(void)
     if (socnum == 0x8015) {
         mailboxregs64 = (volatile struct mailbox_registers64 *)(sep_reg_u + 0x8100);
         is_sep64 = 1;
+    } else if (socnum == 0x7000) {
+        mailboxregs32 = (volatile struct mailbox_registers32 *)(sep_reg_u + 0x1000);
+        // iprintf("Running on A8 processor\n");
+        // iprintf("mailboxregs32 address %x\n", mailboxregs32);
+        is_sep64 = 0;
     } else {
         mailboxregs32 = (volatile struct mailbox_registers32 *)(sep_reg_u + 0x4000);
         is_sep64 = 0;
